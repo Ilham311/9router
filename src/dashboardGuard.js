@@ -67,6 +67,7 @@ const PROTECTED_API_PATHS = [
   "/api/mcp",
   "/api/translator",
   "/api/tunnel",
+  "/api/warp",
 ];
 
 // Routes that spawn child processes or read host secrets — restrict to localhost.
@@ -80,6 +81,9 @@ const LOCAL_ONLY_PATHS = [
   "/api/tunnel/tailscale-check",
   "/api/tunnel/enable",
   "/api/tunnel/disable",
+  "/api/warp/enable",
+  "/api/warp/disable",
+  "/api/warp/rotate",
   "/api/oauth/cursor/auto-import",
   "/api/oauth/kiro/auto-import",
   "/api/oauth/zed/auto-import",

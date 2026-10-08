@@ -1,5 +1,9 @@
 // Patch global fetch with proxy support (must be first)
 import "./utils/proxyFetch.js";
+// Register the WARP egress overlay with the patched fetch layer. The resolver
+// is a live read of the tunnel state, so upstream traffic only routes through
+// WARP while the tunnel is actually up.
+export { setWarpEgressResolver } from "./utils/proxyFetch.js";
 
 // Config
 export { PROVIDERS } from "./config/providers.js";

@@ -47,6 +47,8 @@ const g = global.__appSingleton ??= {
   mitmStartInProgress: false,
   tunnelAutoResumed: false,
   tailscaleAutoResumed: false,
+  warpAutoResumed: false,
+  warpKeepaliveInterval: null,
 };
 
 export async function initializeApp() {
@@ -97,6 +99,16 @@ async function runHeavyStartup() {
     safeRestartTailscale("startup").catch((e) => console.log("[InitApp] Tailscale resume failed:", e.message));
   }
 
+  // Auto-resume the WARP egress tunnel (once per process). Fail-open: a tunnel
+  // problem never blocks booting, upstream just stays on the direct IP.
+  if (settings.warpEnabled && !g.warpAutoResumed) {
+    g.warpAutoResumed = true;
+    console.log("[InitApp] WARP was enabled, auto-resuming...");
+    import("@/lib/warp")
+      .then(({ ensureWarpUp }) => ensureWarpUp())
+      .catch((e) => console.log("[InitApp] WARP resume failed:", e.message));
+  }
+
   if (settings.tunnelEnabled) ensureCloudflared().catch(() => {});
 
   if (settings.mitmEnabled) {
@@ -106,6 +118,13 @@ async function runHeavyStartup() {
   }
 
   configureTunnelMonitoring(settings);
+
+  // Register the WARP egress overlay with the patched fetch layer so upstream
+  // requests route through the tunnel whenever it is up. The resolver reads
+  // live tunnel state, so registering is safe even when the tunnel is down.
+  import("@/lib/warp/warpEgressBinding")
+    .then(({ registerWarpEgress }) => registerWarpEgress())
+    .catch((e) => console.log("[WARP] egress binding failed:", e.message));
 
   if (hasQuotaAutoPingEnabled(settings)) {
     import("@/shared/services/quotaAutoPing")
@@ -243,6 +262,7 @@ function startWatchdog() {
   g.watchdogInterval = setInterval(() => {
     safeRestartTunnel("watchdog").catch(() => {});
     safeRestartTailscale("watchdog").catch(() => {});
+    safeHealWarp().catch(() => {});
   }, WATCHDOG_INTERVAL_MS);
   if (g.watchdogInterval.unref) g.watchdogInterval.unref();
 }
@@ -324,13 +344,29 @@ function stopNetworkMonitor() {
 }
 
 export function configureTunnelMonitoring(settings) {
-  if (settings?.tunnelEnabled || settings?.tailscaleEnabled) {
+  if (settings?.tunnelEnabled || settings?.tailscaleEnabled || settings?.warpEnabled) {
     startWatchdog();
     startNetworkMonitor();
     return;
   }
   stopWatchdog();
   stopNetworkMonitor();
+}
+
+/**
+ * WARP self-heal: mobile/low-memory killers reap background processes, and
+ * sing-box exits silently. If the tunnel is enabled but its process is gone,
+ * bring it back on the SAME endpoint — this is availability, not rotation.
+ */
+async function safeHealWarp() {
+  const settings = await getSettings();
+  if (!settings.warpEnabled) return;
+  try {
+    const { ensureWarpUp } = await import("@/lib/warp");
+    await ensureWarpUp();
+  } catch (e) {
+    console.log("[WARP] self-heal failed:", e?.message || e);
+  }
 }
 
 export default initializeApp;

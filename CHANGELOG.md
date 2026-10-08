@@ -1,6 +1,7 @@
 # v0.5.99 (2026-10-08)
 
 ## Features
+- **WARP Egress**: route upstream requests through a free Cloudflare WARP WireGuard tunnel (via sing-box) so the egress IP providers see can be rotated without a proxy pool — recovers from per-IP 429 sweeps that key rotation alone cannot. Dashboard card on the profile page (enable/disable, manual rotate, live endpoint/colo/IP, auto-rotate toggle); 429 sweep auto-rotation with single-flight + bounded wait (answers `429 + Retry-After` instead of blocking up to 45s); self-heal watchdog; loopback-only SOCKS5 inbound; state persisted `0600`; fail-open when the binary or tunnel is unavailable
 - **Antigravity**: refresh model catalog with Gemini 3.8 Flash (High/Medium/Low), Gemini 3.6 Flash, and Gemini 3.1 Pro High; remove deprecated 3.5/3-flash models; update MITM default to `gemini-3.8-flash-medium`
 - **Antigravity**: add Claude Sonnet 5.5 and Opus 5.5 support with reasoning effort variants, pricing, and family quota routing
 - **Bedrock**: add Amazon Bedrock (`bedrock` and `bedrock-xai`) provider with static keys, AWS SSO profiles, native SigV4 signer, and shared EventStream decoder (#4157)

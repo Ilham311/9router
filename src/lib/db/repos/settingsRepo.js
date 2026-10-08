@@ -47,6 +47,8 @@ const DEFAULT_SETTINGS = {
   outboundProxyEnabled: false,
   outboundProxyUrl: "",
   outboundNoProxy: "",
+  warpEnabled: false, // Cloudflare WARP WireGuard egress tunnel (free, rotates egress IP)
+  warpAutoRotate: true, // auto-rotate the egress endpoint when every account in this colo is 429'd
   mitmRouterBaseUrl: DEFAULT_MITM_ROUTER_BASE,
   dnsToolEnabled: {},
   rtkEnabled: true,

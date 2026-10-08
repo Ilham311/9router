@@ -87,6 +87,17 @@ export async function PATCH(request) {
       applyOutboundProxyEnv(settings);
     }
 
+    // WARP egress is a managed process, not just an env var: toggling it here
+    // brings the tunnel up/down so the change takes effect without a restart.
+    if (Object.prototype.hasOwnProperty.call(body, "warpEnabled")) {
+      import("@/lib/warp")
+        .then(async ({ enableWarp, disableWarp }) => {
+          if (settings.warpEnabled === true) await enableWarp();
+          else await disableWarp();
+        })
+        .catch((error) => console.warn("[WARP] settings update failed:", error.message));
+    }
+
     // Invalidate combo rotation state when strategy settings change
     if (
       Object.prototype.hasOwnProperty.call(body, "comboStrategy") ||

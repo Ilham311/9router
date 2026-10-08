@@ -20,6 +20,11 @@ import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "o
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
+import {
+  AUTO_ROTATE_MIN_INTERVAL_MS,
+  WARP_ROTATE_WAIT_MS,
+  WARP_ROTATE_RETRY_AFTER_MS,
+} from "@/lib/warp/constants.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
@@ -242,6 +247,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastError = null;
   let lastStatus = null;
   let lastHeaders = null;
+  // Set when any account in this sweep failed with 429 — the signature that
+  // the provider is rate-limiting by egress IP rather than per key.
+  let sawRateLimit = false;
+  // A rotation is tried at most once per request: rotating is expensive
+  // (new handshake) and a second rotation within the same request only
+  // amplifies latency without unlocking anything new.
+  let warpRotated = false;
 
   while (true) {
     const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
@@ -249,6 +261,35 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
       if (credentials?.allRateLimited) {
+        // WARP egress rotation: every account saturated in this colo. If the
+        // tunnel is enabled and the failures look per-IP (429s), rotate to a
+        // different endpoint and retry the whole account set once — the locks
+        // are per (account, model), and the egress IP that triggered them has
+        // changed. This recovers cases that key rotation alone cannot.
+        //
+        // Bounded wait only: if the rotation is slow we answer the client with
+        // 429 + Retry-After (SDKs honor it) instead of holding the connection
+        // open for up to 45s. See rotateWarpForSweep().
+        if (sawRateLimit && !warpRotated && await shouldTryWarpRotation()) {
+          warpRotated = true;
+          const rotation = await rotateWarpForSweep(provider, model);
+          if (rotation.ok) {
+            excludeConnectionIds.clear();
+            continue;
+          }
+          if (rotation.timeout) {
+            // Rotation is still rebuilding the tunnel in the background. Tell
+            // the client to come back in a few seconds — by then requests land
+            // on the new egress IP.
+            return unavailableResponse(
+              HTTP_STATUS.RATE_LIMITED,
+              `[${provider}/${model}] rotating egress IP, retry shortly`,
+              new Date(Date.now() + WARP_ROTATE_RETRY_AFTER_MS).toISOString(),
+              "egress rotating",
+              lastHeaders,
+            );
+          }
+        }
         const errorMsg = lastError || credentials.lastError || "Unavailable";
         const status = HTTP_STATUS.SERVICE_UNAVAILABLE;
         log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
@@ -347,9 +388,80 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       lastError = result.error;
       lastStatus = result.status;
       lastHeaders = upstreamResponseHeaders(result.response?.headers);
+      if (result.status === HTTP_STATUS.RATE_LIMITED) sawRateLimit = true;
       continue;
     }
 
     return result.response;
+  }
+}
+
+// ─── WARP egress rotation helpers ─────────────────────────────────────────────
+//
+// Rate limits that are keyed to the egress IP (not the API key) are invisible
+// to key rotation: every account in this colo burns together. Rotating the
+// WARP endpoint changes the IP the provider sees, which unlocks the set.
+//
+// Rotation is deliberately conservative — it is a network round-trip plus a
+// new WireGuard handshake — so it only fires when the failure signature is
+// per-IP (429 sweep) and the tunnel is both enabled and healthy enough that a
+// rotation is likely to land somewhere different.
+
+let lastAutoRotateAt = 0;
+
+/** Is auto-rotation enabled and not on cooldown? */
+async function shouldTryWarpRotation() {
+  try {
+    const settings = await getSettings();
+    if (!settings.warpEnabled || settings.warpAutoRotate === false) return false;
+    // Cooldown: rate limits are per egress IP, so rotating faster than this
+    // just churns the tunnel without unlocking anything new. Concurrent
+    // requests that hit the same sweep all see the cooldown and fall through
+    // to the normal 503 instead of stacking rotations.
+    return Date.now() - lastAutoRotateAt > AUTO_ROTATE_MIN_INTERVAL_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Kick off (or join) the WARP rotation for a 429 sweep, and wait for it up to
+ * WARP_ROTATE_WAIT_MS. Never blocks longer than that: a slow rotation keeps
+ * running in the background, and the caller answers the client with 429 +
+ * Retry-After so it lands on the new egress on its next attempt. Holding the
+ * connection for the full rotation (up to 45s) would blow past client and
+ * proxy timeouts and still serve nobody.
+ *
+ * @returns {Promise<{ok: boolean, timeout?: boolean}>}
+ *   ok=true      — tunnel is on a new egress, retry the account set now
+ *   timeout=true  — rotation still running; answer with Retry-After
+ *   ok=false      — rotation failed or was declined; give up
+ */
+export async function rotateWarpForSweep(provider, model) {
+  try {
+    const { startSweepRotation } = await import("@/lib/warp");
+    const race = Promise.race([
+      startSweepRotation(`429 sweep ${provider}/${model}`),
+      new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), WARP_ROTATE_WAIT_MS)),
+    ]);
+    const result = await race;
+
+    if (result?.ok) {
+      lastAutoRotateAt = Date.now();
+      log.warn("WARP", `⇄ egress rotated (${provider}/${model}) — retrying accounts`);
+      return { ok: true };
+    }
+    if (result?.timeout) {
+      log.warn("WARP", `egress rotation in flight (${provider}/${model}) — answering with Retry-After`);
+      return { ok: false, timeout: true };
+    }
+    // A rotation was already running (busy) or it genuinely failed. Either way
+    // the cooldown is reset only on success, so a failed rotation is not
+    // immediately retried by the next request.
+    log.warn("WARP", `rotation declined (${result?.busy ? "busy" : result?.error || "failed"})`);
+    return { ok: false };
+  } catch (e) {
+    log.warn("WARP", `rotation error: ${e?.message || e}`);
+    return { ok: false };
   }
 }

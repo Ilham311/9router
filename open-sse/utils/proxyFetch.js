@@ -251,6 +251,87 @@ async function getDispatcher(proxyUrl, insecure = false) {
   return proxyDispatchers.get(key);
 }
 
+// ─── SOCKS support ───────────────────────────────────────────────────────────
+// undici's ProxyAgent has no SOCKS support, so a socks5:// URL (e.g. the WARP
+// tunnel's loopback inbound) needs a node http/https request with an explicit
+// agent instead. Mirrors src/lib/mimoLoginSession.js socksFetch.
+let _socksAgentCtor = null;
+async function loadSocksAgent() {
+  if (_socksAgentCtor === null) {
+    _socksAgentCtor = await import("socks-proxy-agent")
+      .then((m) => m.SocksProxyAgent || m.default?.SocksProxyAgent || m.default)
+      .catch((e) => {
+        console.warn(`[ProxyFetch] socks-proxy-agent unavailable: ${e?.message || e}`);
+        return false;
+      });
+  }
+  return _socksAgentCtor || null;
+}
+
+function isSocksProxyUrl(proxyUrl) {
+  try {
+    const proto = new URL(proxyUrl).protocol;
+    return proto === "socks5:" || proto === "socks5h:" || proto === "socks4:" || proto === "socks4a:";
+  } catch { return false; }
+}
+
+async function socksFetch(url, options, proxyUrl) {
+  const SocksProxyAgent = await loadSocksAgent();
+  if (!SocksProxyAgent) throw new Error("socks agent unavailable");
+
+  const nodeUrl = new URL(typeof url === "string" ? url : url.toString());
+  const protoMod = nodeUrl.protocol === "http:" ? await import("node:http") : await import("node:https");
+  const lib = protoMod.default ?? protoMod;
+  const { Readable } = await import("node:stream");
+
+  let headers = {};
+  const raw = options.headers;
+  if (raw instanceof Headers) for (const [k, v] of raw) headers[k] = v;
+  else if (raw) headers = { ...raw };
+
+  let body = options.body;
+  if (body && typeof body !== "string" && !Buffer.isBuffer(body)) body = Buffer.from(body);
+  if (body) headers["content-length"] = String(Buffer.byteLength(body));
+
+  const agent = new SocksProxyAgent(proxyUrl);
+  return new Promise((resolve, reject) => {
+    const req = lib.request(
+      nodeUrl,
+      { method: options.method || "GET", agent, headers },
+      (res) => {
+        const outHeaders = new Headers();
+        for (const [k, v] of Object.entries(res.headers || {})) {
+          if (Array.isArray(v)) v.forEach((x) => outHeaders.append(k, String(x)));
+          else if (v != null) outHeaders.set(k, String(v));
+        }
+        resolve(new Response(Readable.toWeb(res), { status: res.statusCode || 200, headers: outHeaders }));
+      },
+    );
+    const signal = options.signal;
+    if (signal) {
+      if (signal.aborted) req.destroy(new Error("aborted"));
+      else signal.addEventListener("abort", () => req.destroy(new Error("aborted")), { once: true });
+    }
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function fetchWithSocks(url, options, proxyUrl) {
+  // A SOCKS proxy can't be layered on undici; fall back to direct if the
+  // SOCKS attempt fails and the caller didn't demand strict proxying.
+  try {
+    return await socksFetch(url, options, proxyUrl);
+  } catch (socksError) {
+    if (options?.strictProxy === true) {
+      throw new Error(`[ProxyFetch] SOCKS proxy required but failed (strictProxy=true): ${socksError.message}`);
+    }
+    console.warn(`[ProxyFetch] SOCKS proxy failed, falling back to direct: ${socksError.message}`);
+    return fetchWithTlsFallback(url, options, null);
+  }
+}
+
 async function fetchWithTlsFallback(url, options, proxyUrl) {
   try {
     const dispatcher = proxyUrl ? await getDispatcher(proxyUrl) : undefined;
@@ -329,6 +410,44 @@ async function createBypassRequest(parsedUrl, realIP, options) {
   });
 }
 
+/**
+ * WARP egress overlay.
+ *
+ * When the Cloudflare WARP tunnel is up, upstream requests that would
+ * otherwise leave over the direct IP go through the tunnel's loopback SOCKS5
+ * instead. This is injected by the app side (src/lib/warp) via
+ * setWarpEgressResolver — open-sse stays decoupled from the feature and just
+ * sees "an extra candidate proxy URL".
+ *
+ * Resolution priority stays: explicit connection proxy > WARP egress >
+ * env proxy > direct. A connection that deliberately picked its own proxy
+ * pool must not be silently re-routed through WARP.
+ */
+let warpEgressResolver = null;
+
+export function setWarpEgressResolver(resolver) {
+  warpEgressResolver = typeof resolver === "function" ? resolver : null;
+}
+
+function getWarpEgressUrl(targetUrl) {
+  if (!warpEgressResolver) return null;
+  let url;
+  try { url = warpEgressResolver(); } catch { return null; }
+  if (!url) return null;
+  // Never tunnel loopback/LAN traffic — that would loop the gateway's own
+  // internal calls (and break local providers like ollama).
+  if (shouldBypassByNoProxy(targetUrl, `${url}`)) return null;
+  const hostname = (() => { try { return new URL(targetUrl).hostname; } catch { return null; } })();
+  if (!hostname) return null;
+  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") return null;
+  if (PRIVATE_LAN_HOSTS.has(hostname)) return null;
+  return url;
+}
+
+const PRIVATE_LAN_HOSTS = new Set([
+  "localhost", "127.0.0.1", "::1", "0.0.0.0",
+]);
+
 export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const targetUrl = typeof url === "string" ? url : url.toString();
 
@@ -348,14 +467,16 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   }
 
   const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
-  const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
-  const proxyUrl = connectionProxyUrl || envProxyUrl;
+  const warpProxyUrl = connectionProxyUrl ? null : getWarpEgressUrl(targetUrl);
+  const envProxyUrl = (connectionProxyUrl || warpProxyUrl) ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
+  const proxyUrl = connectionProxyUrl || warpProxyUrl || envProxyUrl;
 
   // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
   if (shouldBypassMitmDns(targetUrl)) {
     if (proxyUrl) {
       // Proxy resolves DNS externally (not affected by /etc/hosts) — use proxy directly
       try {
+        if (isSocksProxyUrl(proxyUrl)) return await fetchWithSocks(url, options, proxyUrl);
         return await fetchWithTlsFallback(url, options, proxyUrl);
       } catch (proxyError) {
         if (proxyOptions?.strictProxy === true) {
@@ -375,6 +496,11 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   }
 
   if (proxyUrl) {
+    // SOCKS proxies can't ride on undici's dispatcher — route them through the
+    // node http/https + socks-proxy-agent path instead.
+    if (isSocksProxyUrl(proxyUrl)) {
+      return await fetchWithSocks(url, options, proxyUrl);
+    }
     try {
       return await fetchWithTlsFallback(url, options, proxyUrl);
     } catch (proxyError) {
