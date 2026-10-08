@@ -200,6 +200,10 @@ function isPublicApi(pathname) {
 // Shared with src/proxy.js — the mimo login branch must respect dashboard auth.
 export { isAuthenticated };
 
+// Shared with the WARP status route so the panel can grey out controls that
+// would 403 from a remote peer, instead of answering a click with an error.
+export { hasValidCliToken };
+
 export const __test__ = {
   isLocalRequest,
   isPublicLlmApi,

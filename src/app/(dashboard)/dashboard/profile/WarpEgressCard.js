@@ -104,6 +104,7 @@ export default function WarpEgressCard() {
 
   const enabled = status?.enabled === true;
   const installed = status?.installed === true;
+  const canControl = status?.canControl !== false;
 
   return (
     <Card>
@@ -127,9 +128,16 @@ export default function WarpEgressCard() {
           <Toggle
             checked={enabled}
             onChange={handleToggle}
-            disabled={busy || !installed}
+            disabled={busy || !installed || !canControl}
           />
         </div>
+
+        {!canControl && (
+          <p className="text-xs sm:text-sm text-text-muted">
+            Enable/disable and rotation are only available from a local connection — they
+            change the gateway&apos;s egress for every request.
+          </p>
+        )}
 
         {!installed && (
           <p className="text-xs sm:text-sm text-yellow-600 dark:text-yellow-400">
@@ -152,7 +160,7 @@ export default function WarpEgressCard() {
             size="sm"
             variant="secondary"
             onClick={handleRotate}
-            disabled={busy || !enabled}
+            disabled={busy || !enabled || !canControl}
           >
             <span className="material-symbols-outlined text-[16px] mr-1">sync</span>
             Rotate egress IP
