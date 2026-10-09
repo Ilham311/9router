@@ -245,7 +245,11 @@ async function bringUp({ reason, rotateEndpoint, rotateDevice, socksPort }) {
 
 /**
  * Enable WARP. Idempotent — re-running while up is a no-op.
- * Persists `warpEnabled` so the watchdog auto-resumes after a restart.
+ *
+ * NOTE: `warpEnabled` persistence is the caller's job (the API route writes it
+ * only after this returns ok). Writing it here too raced with the caller's own
+ * write: on a failed handshake this set it false while the caller set it true,
+ * leaving the panel showing "on" with a dead tunnel.
  */
 export async function enableWarp(socksPort = WARP_SOCKS_PORT) {
   return serialize(async () => {
@@ -264,7 +268,6 @@ export async function enableWarp(socksPort = WARP_SOCKS_PORT) {
         rotateDevice: false,
         socksPort,
       });
-      await updateSettings({ warpEnabled: ok });
       return { ok, error: ok ? undefined : "Handshake did not complete on any endpoint" };
     } finally {
       inTunnelOp = false;
@@ -274,6 +277,7 @@ export async function enableWarp(socksPort = WARP_SOCKS_PORT) {
 
 /**
  * Disable WARP and stop routing upstream traffic through it.
+ * Like enableWarp, the caller owns `warpEnabled` persistence.
  */
 export async function disableWarp() {
   return serialize(async () => {
@@ -282,7 +286,6 @@ export async function disableWarp() {
       stopSingbox();
       tunnel = null;
       clearWarpState();
-      await updateSettings({ warpEnabled: false });
       log("disabled");
       return { ok: true };
     } finally {
@@ -365,10 +368,14 @@ export function getSweepRotationState() {
  * Self-heal: restart the tunnel on the same endpoint if the process died
  * (mobile/low-memory killers reap background processes). This is
  * availability, NOT rotation.
+ *
+ * Accepts an explicit `force` so startup can bring the tunnel up for installs
+ * that never stored a WARP preference (default-on). A stored false always wins.
  */
-export async function ensureWarpUp() {
+export async function ensureWarpUp({ force = false } = {}) {
   const settings = await getSettings();
-  if (!settings.warpEnabled) return false;
+  if (settings.warpEnabled === false) return false;
+  if (!settings.warpEnabled && !force) return false;
   return serialize(async () => {
     if (isSingboxRunning()) return true;
     log("process gone; restarting on same endpoint");
@@ -390,7 +397,10 @@ export function getWarpStatus() {
   const running = isSingboxRunning();
   return {
     installed,
-    enabled: tunnel !== null && running,
+    // Reflect the user's intent, not just process liveness: a boot where the
+    // handshake failed still leaves warpEnabled true, and the panel should
+    // show "tunnel down" for that, not an unrelated "off" state.
+    enabled: running && tunnel !== null,
     running,
     busy: inTunnelOp,
     endpoint: tunnel?.endpoint || "",

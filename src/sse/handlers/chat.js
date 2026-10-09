@@ -413,7 +413,12 @@ let lastAutoRotateAt = 0;
 async function shouldTryWarpRotation() {
   try {
     const settings = await getSettings();
-    if (!settings.warpEnabled || settings.warpAutoRotate === false) return false;
+    if (settings.warpEnabled === false) return false; // explicit opt-out
+    if (settings.warpAutoRotate === false) return false;
+    // No point rotating when there is no live tunnel to rotate: the resolver
+    // would return "" (direct egress) regardless, and the 429s are real.
+    const { getActiveEgressProxyUrl } = await import("@/lib/warp");
+    if (!getActiveEgressProxyUrl()) return false;
     // Cooldown: rate limits are per egress IP, so rotating faster than this
     // just churns the tunnel without unlocking anything new. Concurrent
     // requests that hit the same sweep all see the cooldown and fall through

@@ -12,11 +12,11 @@ export async function POST() {
   try {
     const result = await enableWarp();
     if (!result.ok) {
+      // Do NOT persist warpEnabled=true on failure: the panel shows a dead
+      // toggle and the watchdog would keep trying to resurrect the tunnel.
       return NextResponse.json({ error: result.error || "Failed to enable WARP" }, { status: 502 });
     }
-    // Persist the intent so the watchdog auto-resumes after a restart. The
-    // manager already writes this, but a settings update keeps the dashboard
-    // cache coherent without a refetch.
+    // Persist the intent so the watchdog auto-resumes after a restart.
     await updateSettings({ warpEnabled: true }).catch(() => {});
     return NextResponse.json({ ok: true, ...getWarpStatus() });
   } catch (error) {

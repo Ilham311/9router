@@ -9,8 +9,7 @@ const POLL_INTERVAL_MS = 5000;
 function statusBadge(status) {
   if (!status.installed) return <Badge variant="default">Not installed</Badge>;
   if (status.running && status.enabled) return <Badge variant="success" dot>Egress {status.colo || "up"}</Badge>;
-  if (status.running) return <Badge variant="warning" dot>Connecting…</Badge>;
-  if (status.enabled) return <Badge variant="warning">Tunnel down</Badge>;
+  if (status.running || status.defaultOn) return <Badge variant="warning" dot>Connecting…</Badge>;
   return <Badge variant="default">Off</Badge>;
 }
 
@@ -48,9 +47,16 @@ export default function WarpEgressCard() {
       const res = await fetch(endpoint, { method: "POST" });
       const data = await res.json();
       if (!res.ok) {
-        setError(data.error || "Operation failed");
-        notify.error(`WARP: ${data.error || "operation failed"}`);
-      } else if (data.error) {
+        const msg = data.error || "Operation failed";
+        setError(msg);
+        notify.error(`WARP: ${msg}`);
+        // The server rejected the toggle (e.g. sing-box missing or handshake
+        // failed). Fetch the authoritative status so the switch snaps back
+        // instead of showing a state the server never accepted.
+        await fetchStatus();
+        return;
+      }
+      if (data.error) {
         setError(data.error);
       } else {
         notify.success(enabled ? "WARP egress enabled" : "WARP egress disabled");
@@ -58,6 +64,7 @@ export default function WarpEgressCard() {
       await fetchStatus();
     } catch (e) {
       setError(e?.message || "Network error");
+      await fetchStatus();
     } finally {
       setBusy(false);
     }
@@ -102,7 +109,7 @@ export default function WarpEgressCard() {
     }
   }, []);
 
-  const enabled = status?.enabled === true;
+  const enabled = status?.enabled === true || status?.defaultOn === true;
   const installed = status?.installed === true;
   const canControl = status?.canControl !== false;
 
@@ -146,12 +153,12 @@ export default function WarpEgressCard() {
           </p>
         )}
 
-        {installed && enabled && status && (
+        {installed && (enabled || status) && (
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <Stat label="Endpoint" value={status.endpoint || "—"} mono />
-            <Stat label="Colo" value={status.colo || "—"} mono />
-            <Stat label="Egress IP" value={status.ip || "—"} mono />
-            <Stat label="Proxy" value={status.socksPort ? `socks5 127.0.0.1:${status.socksPort}` : "—"} mono />
+            <Stat label="Endpoint" value={status?.endpoint || "—"} mono />
+            <Stat label="Colo" value={status?.colo || "—"} mono />
+            <Stat label="Egress IP" value={status?.ip || "—"} mono />
+            <Stat label="Proxy" value={status?.socksPort ? `socks5 127.0.0.1:${status.socksPort}` : "—"} mono />
           </div>
         )}
 

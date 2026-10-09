@@ -90,6 +90,15 @@ export function mergeWithDefaults(raw) {
       }
     }
   }
+  // WARP is default-on for installs with no stored preference, but EXISTING
+  // installs keep their choice. The spread above back-fills warpEnabled:false
+  // for raw rows that omit it, which would defeat that. readRaw() reports the
+  // no-DB case as null, and rows that predate this key omit it — either way,
+  // restore the undefined so callers can distinguish "no preference" from
+  // "deliberately off".
+  if (raw === null || raw === undefined || !("warpEnabled" in raw)) {
+    merged.warpEnabled = undefined;
+  }
   if (merged.capacityAdapter && typeof merged.capacityAdapter === "object") {
     for (const capKey of Object.keys(merged.capacityAdapter)) {
       const entry = merged.capacityAdapter[capKey];

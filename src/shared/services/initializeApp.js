@@ -101,12 +101,31 @@ async function runHeavyStartup() {
 
   // Auto-resume the WARP egress tunnel (once per process). Fail-open: a tunnel
   // problem never blocks booting, upstream just stays on the direct IP.
-  if (settings.warpEnabled && !g.warpAutoResumed) {
+  //
+  // WARP is on by default for new installs: the egress overlay is invisible
+  // when the tunnel is down (getActiveEgressProxyUrl returns "" and traffic
+  // flows direct), so enabling it costs nothing when sing-box is unavailable
+  // and silently protects against per-IP 429s when it is. Existing installs
+  // keep whatever the user picked — a stored warpEnabled=false wins.
+  if (!g.warpAutoResumed && (settings.warpEnabled || isWarpDefaultOn(settings))) {
     g.warpAutoResumed = true;
-    console.log("[InitApp] WARP was enabled, auto-resuming...");
+    console.log("[InitApp] WARP auto-starting (warpEnabled =", settings.warpEnabled, ")...");
     import("@/lib/warp")
-      .then(({ ensureWarpUp }) => ensureWarpUp())
-      .catch((e) => console.log("[InitApp] WARP resume failed:", e.message));
+      .then(async ({ enableWarp, isSingboxInstalled, getWarpStatus }) => {
+        // Never spawn anything if the binary is missing — the tunnel would
+        // just fail, and the panel would show a permanent error state.
+        if (!isSingboxInstalled()) {
+          console.log("[InitApp] WARP: sing-box not installed, staying on direct egress");
+          return;
+        }
+        const result = await enableWarp();
+        if (!result.ok) console.log("[InitApp] WARP enable failed:", result.error || "handshake");
+        else {
+          const s = getWarpStatus();
+          console.log(`[InitApp] WARP up: ip=${s.ip} colo=${s.colo}`);
+        }
+      })
+      .catch((e) => console.log("[InitApp] WARP startup failed:", e.message));
   }
 
   if (settings.tunnelEnabled) ensureCloudflared().catch(() => {});
@@ -142,6 +161,17 @@ async function runHeavyStartup() {
 function hasQuotaAutoPingEnabled(settings) {
   return [settings?.claudeAutoPing, settings?.codexAutoPing]
     .some((config) => Object.values(config?.connections || {}).some(Boolean));
+}
+
+/**
+ * Should WARP come up by default?
+ *
+ * `true` only for installs that never stored a WARP preference (new installs
+ * and installs from before this key existed). A stored `warpEnabled: false`
+ * means the user deliberately turned it off and must not be overridden.
+ */
+function isWarpDefaultOn(settings) {
+  return settings?.warpEnabled === undefined;
 }
 
 async function autoStartMitm(settings) {
@@ -344,7 +374,7 @@ function stopNetworkMonitor() {
 }
 
 export function configureTunnelMonitoring(settings) {
-  if (settings?.tunnelEnabled || settings?.tailscaleEnabled || settings?.warpEnabled) {
+  if (settings?.tunnelEnabled || settings?.tailscaleEnabled || isWarpDefaultOn(settings) || settings?.warpEnabled) {
     startWatchdog();
     startNetworkMonitor();
     return;
@@ -360,9 +390,12 @@ export function configureTunnelMonitoring(settings) {
  */
 async function safeHealWarp() {
   const settings = await getSettings();
-  if (!settings.warpEnabled) return;
+  // Respect both an explicit opt-out and an implicit one: a stored false is
+  // the user's choice, and we must not resurrect what they disabled.
+  if (!isWarpDefaultOn(settings) && !settings.warpEnabled) return;
   try {
-    const { ensureWarpUp } = await import("@/lib/warp");
+    const { ensureWarpUp, isSingboxInstalled } = await import("@/lib/warp");
+    if (!isSingboxInstalled()) return;
     await ensureWarpUp();
   } catch (e) {
     console.log("[WARP] self-heal failed:", e?.message || e);

@@ -23,6 +23,9 @@ export async function GET(request) {
       value = {
         ...getWarpStatus(),
         canControl,
+        // WARP is default-on for installs with no stored preference. The panel
+        // uses this to show "connecting…" instead of "off" on a fresh boot.
+        defaultOn: settings.warpEnabled === undefined,
         // Settings-backed preferences (the toggle itself is also persisted
         // here so the panel reflects state even before the tunnel answers).
         autoRotate: settings.warpAutoRotate !== false,
